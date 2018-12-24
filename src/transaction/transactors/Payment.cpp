@@ -64,31 +64,12 @@ public:
             return temINVALID_FLAG;
         }
 
-        bool const partialPaymentAllowed = uTxFlags & tfPartialPayment;
-        bool const limitQuality = uTxFlags & tfLimitQuality;
-        bool const defaultPathsAllowed = !(uTxFlags & tfNoSkywellDirect);
-        bool const bPaths = mTxn.isFieldPresent (sfPaths);
-        bool const bMax = mTxn.isFieldPresent (sfSendMax);
 
         STAmount const saDstAmount (mTxn.getFieldAmount (sfAmount));
 
-        STAmount maxSourceAmount;
 
-        if (bMax)
-            maxSourceAmount = mTxn.getFieldAmount (sfSendMax);
-        else if (saDstAmount.isNative ())
-            maxSourceAmount = saDstAmount;
-        else
-            maxSourceAmount = STAmount (
-                { saDstAmount.getCurrency (), mTxnAccountID },
-                saDstAmount.mantissa(), saDstAmount.exponent (),
-                saDstAmount < zero);
 
-        auto const& uSrcCurrency = maxSourceAmount.getCurrency ();
-        auto const& uDstCurrency = saDstAmount.getCurrency ();
 
-        // isZero() is SWT.  FIX!
-        bool const bSWTDirect = uSrcCurrency.isZero () && uDstCurrency.isZero ();
 
         if (!isLegalNet (saDstAmount) || !isLegalNet (maxSourceAmount))
             return temBAD_AMOUNT;
@@ -101,11 +82,10 @@ public:
                 "Payment destination account not specified.";
             return temDST_NEEDED;
         }
-        if (bMax && maxSourceAmount <= zero)
+        if(!saDstAmount.isNative ())
         {
-            m_journal.trace << "Malformed transaction: " <<
-                "bad max amount: " << maxSourceAmount.getFullText ();
-            return temBAD_AMOUNT;
+           m_journal.trace<<"bad amount";
+           return temBAD_AMOUNT;
         }
         if (saDstAmount <= zero)
         {
@@ -113,13 +93,7 @@ public:
                 "bad dst amount: " << saDstAmount.getFullText ();
             return temBAD_AMOUNT;
         }
-        if (badCurrency() == uSrcCurrency || badCurrency() == uDstCurrency)
-        {
-            m_journal.trace <<"Malformed transaction: " <<
-                "Bad currency.";
-            return temBAD_CURRENCY;
-        }
-        if (mTxnAccountID == uDstAccountID && uSrcCurrency == uDstCurrency && !bPaths)
+        if (mTxnAccountID == uDstAccountID)
         {
             // You're signing yourself a payment.
             // If bPaths is true, you might be trying some arbitrage.
@@ -137,41 +111,6 @@ public:
                 " to blacklist account  " << to_string (uDstAccountID);
 	          return telBLKLIST;
         }
-        if (bSWTDirect && bMax)
-        {
-            // Consistent but redundant transaction.
-            m_journal.trace << "Malformed transaction: " <<
-                "SendMax specified for SWT to SWT.";
-            return temBAD_SEND_SWT_MAX;
-        }
-        if (bSWTDirect && bPaths)
-        {
-            // SWT is sent without paths.
-            m_journal.trace << "Malformed transaction: " <<
-                "Paths specified for SWT to SWT.";
-            return temBAD_SEND_SWT_PATHS;
-        }
-        if (bSWTDirect && partialPaymentAllowed)
-        {
-            // Consistent but redundant transaction.
-            m_journal.trace << "Malformed transaction: " <<
-                "Partial payment specified for SWT to SWT.";
-            return temBAD_SEND_SWT_PARTIAL;
-        }
-        if (bSWTDirect && limitQuality)
-        {
-            // Consistent but redundant transaction.
-            m_journal.trace << "Malformed transaction: " <<
-                "Limit quality specified for SWT to SWT.";
-            return temBAD_SEND_SWT_LIMIT;
-        }
-        if (bSWTDirect && !defaultPathsAllowed)
-        {
-            // Consistent but redundant transaction.
-            m_journal.trace << "Malformed transaction: " <<
-                "No skywell direct specified for SWT to SWT.";
-            return temBAD_SEND_SWT_NO_DIRECT;
-        }
 	  if(mEngine->view ().accountFundsCheck(mTxnAccountID,bMax? mTxn.getFieldAmount (sfSendMax):saDstAmount))
         {
             // Consistent but redundant transaction.
@@ -188,26 +127,9 @@ public:
         // Skywell if source or destination is non-native or if there are paths.
         std::uint32_t const uTxFlags = mTxn.getFlags ();
         bool const partialPaymentAllowed = uTxFlags & tfPartialPayment;
-        bool const limitQuality = uTxFlags & tfLimitQuality;
-        bool const defaultPathsAllowed = !(uTxFlags & tfNoSkywellDirect);
-        bool const bPaths = mTxn.isFieldPresent (sfPaths);
-        bool const bMax = mTxn.isFieldPresent (sfSendMax);
         Account const uDstAccountID (mTxn.getFieldAccount160 (sfDestination));
         STAmount const saDstAmount (mTxn.getFieldAmount (sfAmount));
         STAmount maxSourceAmount;
-        if (bMax)
-            maxSourceAmount = mTxn.getFieldAmount (sfSendMax);
-        else if (saDstAmount.isNative ())
-            maxSourceAmount = saDstAmount;
-        else
-          maxSourceAmount = STAmount (
-              {saDstAmount.getCurrency (), mTxnAccountID},
-              saDstAmount.mantissa(), saDstAmount.exponent (),
-              saDstAmount < zero);
-
-        m_journal.trace <<
-            "maxSourceAmount=" << maxSourceAmount.getFullText () <<
-            " saDstAmount=" << saDstAmount.getFullText ();
 
         // Open a ledger for editing.
         auto const index = getAccountRootIndex (uDstAccountID);
@@ -215,16 +137,6 @@ public:
 
         if (!sleDst)
         {
-            // Destination account does not exist.
-            if (!saDstAmount.isNative ())
-            {
-                m_journal.trace <<
-                    "Delay transaction: Destination account does not exist.";
-
-                // Another transaction could create the account and then this
-                // transaction would succeed.
-                return tecNO_DST;
-            }
             else if (mParams & tapOPEN_LEDGER && partialPaymentAllowed)
             {
                 // You cannot fund an account with a partial payment.
@@ -279,129 +191,10 @@ public:
 
         TER terResult;
 
-        bool const bSkywell = bPaths || bMax || !saDstAmount.isNative ();
         // XXX Should bMax be sufficient to imply skywell?
-
-        if (bSkywell)
+        
         {
-            // Skywell payment with at least one intermediate step and uses
-            // transitive balances.
-
-            // Copy paths into an editable class.
-            STPathSet spsPaths = mTxn.getFieldPathSet (sfPaths);
-
-            try
-            {
-                path::SkywellCalc::Input rcInput;
-                rcInput.partialPaymentAllowed = partialPaymentAllowed;
-                rcInput.defaultPathsAllowed = defaultPathsAllowed;
-                rcInput.limitQuality = limitQuality;
-                rcInput.deleteUnfundedOffers = true;
-                rcInput.isLedgerOpen = static_cast<bool>(mParams & tapOPEN_LEDGER);
-		    Ledger::pointer lpClosed    = getApp().getLedgerMaster ().getClosedLedger();
-		    Account mIssuerAccountID = lpClosed->getIssuerOpAccountID ();
-
-                bool pathTooBig = spsPaths.size () > MaxPathSize;
-
-                for (auto const& path : spsPaths)
-                    if (path.size () > MaxPathLength)
-                        pathTooBig = true;
-
-                if (rcInput.isLedgerOpen && pathTooBig)
-                {
-                    terResult = telBAD_PATH_COUNT; // Too many paths for proposed ledger.
-                }
-		   else if(mTxnAccountID == mIssuerAccountID)
-                {
-                	if(!isSWT(saDstAmount.getCurrency ()))
-                	{
-                		if(uDstAccountID != saDstAmount.getIssuer())
-                		{
-				       STAmount issue_amount = STAmount ({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-					Issue issue = Issue({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-				   	mEngine->view ().issue_trust_auto(uDstAccountID,issue_amount,issue,false);
-                		}
-                	}
-                    path::SkywellCalc::Output rc;
-                    {
-                        ScopedDeferCredits g (mEngine->view ());
-			    maxSourceAmount.setIssuer(saDstAmount.getIssuer());
-                        rc = path::SkywellCalc::skywellCalculate (
-                            mEngine->view (),
-                            maxSourceAmount,
-                            saDstAmount,
-                            uDstAccountID,
-                            saDstAmount.getIssuer(),
-                            spsPaths,
-                            &rcInput);
-                    }
-
-                    // TODO: is this right?  If the amount is the correct amount, was
-                    // the delivered amount previously set?
-                    if (rc.result () == tesSUCCESS && rc.actualAmountOut != saDstAmount)
-                        mEngine->view ().setDeliveredAmount (rc.actualAmountOut);
-					
-                    terResult = rc.result ();
-                }
-                else if(mTxnAccountID == saDstAmount.getIssuer())
-             	   {
-                    terResult = tecNO_PERMISSION;
-             	   }
-		   else
-                {
-                	if(!isSWT(saDstAmount.getCurrency ()))
-                	{
-                		if(uDstAccountID != saDstAmount.getIssuer())
-                		{
-				       STAmount issue_amount = STAmount ({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-					Issue issue = Issue({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-				   	mEngine->view ().issue_trust_auto(uDstAccountID,issue_amount,issue,false);
-                		}
-                	}
-                    path::SkywellCalc::Output rc;
-                    {
-                        ScopedDeferCredits g (mEngine->view ());
-                        rc = path::SkywellCalc::skywellCalculate (
-                            mEngine->view (),
-                            maxSourceAmount,
-                            saDstAmount,
-                            uDstAccountID,
-                            mTxnAccountID,
-                            spsPaths,
-                            &rcInput);
-                    }
-
-                    // TODO: is this right?  If the amount is the correct amount, was
-                    // the delivered amount previously set?
-                    if (rc.result () == tesSUCCESS && rc.actualAmountOut != saDstAmount)
-                        mEngine->view ().setDeliveredAmount (rc.actualAmountOut);
-/*					
-                	if(isUserTum(saDstAmount.getCurrency ()))
-                	{
-			       STAmount issue_amount = STAmount ({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-				Issue issue = Issue({saDstAmount.getCurrency (), saDstAmount.getIssuer()});
-			   	mEngine->view ().issue_trust_auto(mTxnAccountID,issue_amount,issue,true);
-                	}
-*/
-                    terResult = rc.result ();
-                }
-
-                // TODO(tom): what's going on here?
-                if (isTerRetry (terResult))
-                    terResult = tecPATH_DRY;
-
-            }
-            catch (std::exception const& e)
-            {
-                m_journal.trace <<
-                    "Caught throw: " << e.what ();
-
-                terResult = tefEXCEPTION;
-            }
-        }
-        else
-        {
-            // Direct SWT payment.
+            // SWT payment.
 
             // uOwnerCount is the number of entries in this legder for this account
             // that require a reserve.

@@ -1095,6 +1095,41 @@ void LedgerEntrySet::decrementOwnerCount (Account const& owner)
         getAccountRootIndex (owner)));
 }
 
+TER LedgerEntrySet::offerDelete (SLE::pointer sleOffer)
+{
+    if (!sleOffer)
+        return tesSUCCESS;
+
+    auto offerIndex = sleOffer->getIndex ();
+    auto owner = sleOffer->getFieldAccount160  (sfAccount);
+   STAmount saTakerGets = sleOffer->getFieldAmount (sfTakerGets);
+
+    // Detect legacy directories.
+    bool bOwnerNode = sleOffer->isFieldPresent (sfOwnerNode);
+    std::uint64_t uOwnerNode = sleOffer->getFieldU64 (sfOwnerNode);
+    uint256 uDirectory = sleOffer->getFieldH256 (sfBookDirectory);
+    std::uint64_t uBookNode  = sleOffer->getFieldU64 (sfBookNode);
+
+    TER terResult  = dirDelete (false, 
+                                uOwnerNode,
+                                getOwnerDirIndex (owner), 
+                                offerIndex, 
+                                false, 
+                                !bOwnerNode);
+    TER terResult2 = dirDelete (false, 
+                                uBookNode, 
+                                uDirectory, 
+                                offerIndex, 
+                                true, 
+                                false);
+
+    if (tesSUCCESS == terResult)
+        decrementOwnerCount (owner);
+
+    entryDelete (sleOffer);
+
+    return (terResult == tesSUCCESS) ? terResult2 : terResult;
+}
 
 // Return how much of issuer's currency IOUs that account holds.  May be
 // negative.
@@ -1184,9 +1219,45 @@ STAmount LedgerEntrySet::accountHolds (
 
 }
 
+bool LedgerEntrySet::isGlobalFrozen (Account const& issuer)
+{
+    if (isSWT (issuer))
+        return false;
+
+    SLE::pointer sle = entryCache (ltACCOUNT_ROOT, getAccountRootIndex (issuer));
+    if (sle && sle->isFlag (lsfGlobalFreeze))
+        return true;
+
+    return false;
+}
 
 // Can the specified account spend the specified currency issued by
 // the specified issuer or does the freeze flag prohibit it?
+bool LedgerEntrySet::isFrozen(
+    Account const& account,
+    Currency const& currency,
+    Account const& issuer)
+{
+    if (isSWT (currency))
+        return false;
+
+    SLE::pointer sle = entryCache (ltACCOUNT_ROOT, getAccountRootIndex (issuer));
+    if (sle && sle->isFlag (lsfGlobalFreeze))
+        return true;
+
+    if (issuer != account)
+    {
+        // Check if the issuer froze the line
+        sle = entryCache (ltSKYWELL_STATE,
+            getSkywellStateIndex (account, issuer, currency));
+        if (sle && sle->isFlag ((issuer > account) ? lsfHighFreeze : lsfLowFreeze))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // Returns the funds available for account for a currency/issuer.
 // Use when you need a default for rippling account's currency.
@@ -1225,6 +1296,324 @@ STAmount LedgerEntrySet::accountFunds (
     return saFunds;
 }
 
+TER LedgerEntrySet::relationCreate (
+    const bool      bSrcHigh,
+    Account const&  uSrcAccountID,
+    Account const&  uDstAccountID,
+    uint256 const&  uIndex,             // --> skywell state entry
+    SLE::ref        sleAccount,         // --> the account being set.
+    STAmount const& saBalance,          // --> balance of account being set.
+                                        // Issuer should be noAccount()
+    STAmount const& saLimit,            // --> limit for account being set.
+                                        // Issuer should be the account being set.
+    const std::uint32_t uQualityIn,
+    const std::uint32_t uQualityOut)
+{
+    WriteLog (lsTRACE, LedgerEntrySet)
+        << "relationCreate: " << to_string (uSrcAccountID) << ", "
+        << to_string (uDstAccountID) << ", " << saBalance.getFullText ();
+
+    auto const& uLowAccountID   = !bSrcHigh ? uSrcAccountID : uDstAccountID;
+    auto const& uHighAccountID  =  bSrcHigh ? uSrcAccountID : uDstAccountID;
+
+    SLE::pointer sleSkywellState  = entryCreate (ltTrust_STATE, uIndex);
+
+    std::uint64_t   uLowNode;
+    std::uint64_t   uHighNode;
+
+    TER terResult = dirAdd (
+        uLowNode,
+        getOwnerDirIndex (uLowAccountID),
+        sleSkywellState->getIndex (),
+        std::bind (&Ledger::ownerDirDescriber,
+                   std::placeholders::_1, std::placeholders::_2,
+                   uLowAccountID));
+
+    if (tesSUCCESS == terResult)
+    {
+        terResult = dirAdd (
+            uHighNode,
+            getOwnerDirIndex (uHighAccountID),
+            sleSkywellState->getIndex (),
+            std::bind (&Ledger::ownerDirDescriber,
+                       std::placeholders::_1, std::placeholders::_2,
+                       uHighAccountID));
+    }
+
+    if (tesSUCCESS == terResult)
+    {
+        const bool bSetDst = saLimit.getIssuer () == uDstAccountID;
+        const bool bSetHigh = bSrcHigh ^ bSetDst;
+
+        assert (sleAccount->getFieldAccount160 (sfAccount) ==
+            (bSetHigh ? uHighAccountID : uLowAccountID));
+        SLE::pointer slePeer = entryCache (ltACCOUNT_ROOT,
+            getAccountRootIndex (bSetHigh ? uLowAccountID : uHighAccountID));
+        assert (slePeer);
+
+        // Remember deletion hints.
+        sleSkywellState->setFieldU64 (sfLowNode, uLowNode);
+        sleSkywellState->setFieldU64 (sfHighNode, uHighNode);
+
+        sleSkywellState->setFieldAmount (
+            bSetHigh ? sfHighLimit : sfLowLimit, saLimit);
+        sleSkywellState->setFieldAmount (
+            bSetHigh ? sfLowLimit : sfHighLimit,
+            STAmount ({saBalance.getCurrency (),
+                       bSetDst ? uSrcAccountID : uDstAccountID}));
+
+        if (uQualityIn)
+            sleSkywellState->setFieldU32 (
+                bSetHigh ? sfHighQualityIn : sfLowQualityIn, uQualityIn);
+
+        if (uQualityOut)
+            sleSkywellState->setFieldU32 (
+                bSetHigh ? sfHighQualityOut : sfLowQualityOut, uQualityOut);
+
+        incrementOwnerCount (sleAccount);
+
+        // ONLY: Create skywell balance.
+        sleSkywellState->setFieldAmount (sfBalance, bSetHigh ? -saBalance : saBalance);
+
+        cacheCredit (uSrcAccountID, uDstAccountID, saBalance);
+    }
+
+    return terResult;
+}
+
+TER LedgerEntrySet::signCreate(
+	uint256 const&  uIndex,
+	SLE::ref        sleAccount,         // --> the account being set
+	Account const&  uSrcAccountID,
+	const std::uint16_t uMasterWeight,
+	const std::uint32_t uQuorum,
+	const std::uint32_t uQuorumHigh,
+	STArray const& saSignEntries)
+{
+	WriteLog(lsTRACE, LedgerEntrySet) << "signCreate: " << to_string(uSrcAccountID);
+
+	SLE::pointer sleSkywellState = entryCreate(ltSIGNER_LIST, uIndex);
+
+	std::uint64_t   uNode;
+
+	TER terResult = dirAdd(
+		uNode,
+		getOwnerDirIndex(uSrcAccountID),
+		sleSkywellState->getIndex(),
+		std::bind(&Ledger::ownerDirDescriber,
+		std::placeholders::_1, std::placeholders::_2,
+		uSrcAccountID));
+
+	if (tesSUCCESS == terResult)
+	{
+		assert(sleAccount->getFieldAccount160(sfAccount) == 
+			uSrcAccountID);
+
+		sleSkywellState->setFieldAccount(sfAccount, uSrcAccountID);
+
+		if (uMasterWeight)
+			sleSkywellState->setFieldU16(
+			sfMasterWeight, uMasterWeight);
+
+		if (uQuorum)
+			sleSkywellState->setFieldU32(
+			sfQuorum, uQuorum);
+
+		if (uQuorumHigh)
+			sleSkywellState->setFieldU32(
+			sfQuorumHigh, uQuorumHigh);
+
+		if (!saSignEntries.empty())
+			sleSkywellState->setFieldArray(
+			sfSignerEntries, saSignEntries);
+
+        incrementOwnerCount(sleAccount);
+
+	}
+	return terResult;
+}
+
+
+
+void LedgerEntrySet::enableDeferredCredits (bool enable)
+{
+    assert(enable == !mDeferredCredits);
+
+    if (!enable)
+    {
+        mDeferredCredits.reset ();
+        return;
+    }
+
+    if (!mDeferredCredits)
+        mDeferredCredits.emplace ();
+}
+
+bool LedgerEntrySet::areCreditsDeferred () const
+{
+    return static_cast<bool> (mDeferredCredits);
+}
+
+STAmount LedgerEntrySet::adjustedBalance (Account const& main,
+                                            Account const& other,
+                                            STAmount const& amount) const
+{
+    if (mDeferredCredits)
+        return mDeferredCredits->adjustedBalance (main, other, amount);
+
+    return amount;
+}
+
+void LedgerEntrySet::cacheCredit (Account const& sender,
+                                  Account const& receiver,
+                                  STAmount const& amount)
+{
+    if (mDeferredCredits)
+        return mDeferredCredits->credit (sender, receiver, amount);
+}
+
+// Direct send w/o fees:
+// - Redeeming IOUs and/or sending sender's own IOUs.
+// - Create trust line of needed.
+// --> bCheckIssuer : normally require issuer to be involved.
+TER LedgerEntrySet::skywellCredit (
+    Account const& uSenderID, Account const& uReceiverID,
+    STAmount const& saAmount, bool bCheckIssuer)
+{
+    auto issuer = saAmount.getIssuer ();
+    auto currency = saAmount.getCurrency ();
+
+    // Make sure issuer is involved.
+    assert (!bCheckIssuer || uSenderID == issuer || uReceiverID == issuer);
+
+    (void) issuer;
+
+    // Disallow sending to self.
+    assert (uSenderID != uReceiverID);
+
+    bool bSenderHigh = uSenderID > uReceiverID;
+    uint256 uIndex = getSkywellStateIndex (
+        uSenderID, uReceiverID, saAmount.getCurrency ());
+    auto sleSkywellState  = entryCache (ltSKYWELL_STATE, uIndex);
+
+    TER terResult;
+
+    assert (!isSWT (uSenderID) && uSenderID != noAccount());
+    assert (!isSWT (uReceiverID) && uReceiverID != noAccount());
+
+    if (!sleSkywellState)
+    {
+        STAmount saReceiverLimit({currency, uReceiverID});
+        STAmount saBalance = saAmount;
+
+        saBalance.setIssuer (noAccount());
+
+        WriteLog (lsDEBUG, LedgerEntrySet) << "skywellCredit: "
+            "create line: " << to_string (uSenderID) <<
+            " -> " << to_string (uReceiverID) <<
+            " : " << saAmount.getFullText ();
+
+        SLE::pointer sleAccount = entryCache (ltACCOUNT_ROOT,
+            getAccountRootIndex (uReceiverID));
+
+        bool noSkywell = (sleAccount->getFlags() & lsfDefaultSkywell) == 1;
+
+        // if (skywell::legacy::emulate027 (mLedger))
+        //     noSkywell = false;
+
+        terResult = trustCreate (
+            bSenderHigh,
+            uSenderID,
+            uReceiverID,
+            uIndex,
+            sleAccount,
+            false,
+            noSkywell,
+            false,
+            saBalance,
+            saReceiverLimit);
+    }
+    else
+    {
+        cacheCredit (uSenderID, uReceiverID, saAmount);
+
+        STAmount    saBalance   = sleSkywellState->getFieldAmount (sfBalance);
+
+        if (bSenderHigh)
+            saBalance.negate ();    // Put balance in sender terms.
+
+        STAmount    saBefore    = saBalance;
+
+        saBalance   -= saAmount;
+
+        WriteLog (lsTRACE, LedgerEntrySet) << "skywellCredit: " <<
+            to_string (uSenderID) <<
+            " -> " << to_string (uReceiverID) <<
+            " : before=" << saBefore.getFullText () <<
+            " amount=" << saAmount.getFullText () <<
+            " after=" << saBalance.getFullText ();
+
+        std::uint32_t const uFlags (sleSkywellState->getFieldU32 (sfFlags));
+        bool bDelete = false;
+
+        // YYY Could skip this if rippling in reverse.
+        if (saBefore > zero
+            // Sender balance was positive.
+            && saBalance <= zero
+            // Sender is zero or negative.
+            && (uFlags & (!bSenderHigh ? lsfLowReserve : lsfHighReserve))
+            // Sender reserve is set.
+            && static_cast <bool> (uFlags & (!bSenderHigh ? lsfLowNoSkywell : lsfHighNoSkywell)) ==
+               static_cast <bool> (entryCache (ltACCOUNT_ROOT,
+                   getAccountRootIndex (uSenderID))->getFlags() & lsfDefaultSkywell)
+            && !(uFlags & (!bSenderHigh ? lsfLowFreeze : lsfHighFreeze))
+            && !sleSkywellState->getFieldAmount (
+                !bSenderHigh ? sfLowLimit : sfHighLimit)
+            // Sender trust limit is 0.
+            && !sleSkywellState->getFieldU32 (
+                !bSenderHigh ? sfLowQualityIn : sfHighQualityIn)
+            // Sender quality in is 0.
+            && !sleSkywellState->getFieldU32 (
+                !bSenderHigh ? sfLowQualityOut : sfHighQualityOut))
+            // Sender quality out is 0.
+        {
+            // Clear the reserve of the sender, possibly delete the line!
+            decrementOwnerCount (uSenderID);
+
+            // Clear reserve flag.
+            sleSkywellState->setFieldU32 (
+                sfFlags,
+                uFlags & (!bSenderHigh ? ~lsfLowReserve : ~lsfHighReserve));
+
+            // Balance is zero, receiver reserve is clear.
+            bDelete = !saBalance        // Balance is zero.
+                && !(uFlags & (bSenderHigh ? lsfLowReserve : lsfHighReserve));
+            // Receiver reserve is clear.
+        }
+
+        if (bSenderHigh)
+            saBalance.negate ();
+
+        // Want to reflect balance to zero even if we are deleting line.
+        sleSkywellState->setFieldAmount (sfBalance, saBalance);
+        // ONLY: Adjust skywell balance.
+
+        if (bDelete)
+        {
+            terResult   = trustDelete (
+                sleSkywellState,
+                bSenderHigh ? uReceiverID : uSenderID,
+                !bSenderHigh ? uReceiverID : uSenderID);
+        }
+        else
+        {
+            entryModify (sleSkywellState);
+            terResult   = tesSUCCESS;
+        }
+    }
+
+    return terResult;
+}
 
 // Calculate the fee needed to transfer IOU assets between two parties.
 STAmount LedgerEntrySet::skywellTransferFee (
@@ -1253,6 +1642,154 @@ STAmount LedgerEntrySet::skywellTransferFee (
     return saAmount.zeroed();
 }
 
+// Send regardless of limits.
+// --> saAmount: Amount/currency/issuer to deliver to reciever.
+// <-- saActual: Amount actually cost.  Sender pay's fees.
+TER LedgerEntrySet::skywellSend (
+    Account const& uSenderID, Account const& uReceiverID,
+    STAmount const& saAmount, STAmount& saActual)
+{
+    auto const issuer   = saAmount.getIssuer ();
+    TER             terResult;
+
+    assert (!isSWT (uSenderID) && !isSWT (uReceiverID));
+    assert (uSenderID != uReceiverID);
+
+    if (uSenderID == issuer || uReceiverID == issuer || issuer == noAccount())
+    {
+        // Direct send: redeeming IOUs and/or sending own IOUs.
+        terResult   = skywellCredit (uSenderID, uReceiverID, saAmount, false);
+        saActual    = saAmount;
+        terResult   = tesSUCCESS;
+    }
+    else
+    {
+        // Sending 3rd party IOUs: transit.
+
+        STAmount saTransitFee = skywellTransferFee (
+            uSenderID, uReceiverID, issuer, saAmount);
+
+        saActual = !saTransitFee ? saAmount : saAmount + saTransitFee;
+
+        saActual.setIssuer (issuer); // XXX Make sure this done in + above.
+
+        WriteLog (lsDEBUG, LedgerEntrySet) << "skywellSend> " <<
+            to_string (uSenderID) <<
+            " - > " << to_string (uReceiverID) <<
+            " : deliver=" << saAmount.getFullText () <<
+            " fee=" << saTransitFee.getFullText () <<
+            " cost=" << saActual.getFullText ();
+
+        terResult   = skywellCredit (issuer, uReceiverID, saAmount);
+
+        if (tesSUCCESS == terResult)
+            terResult   = skywellCredit (uSenderID, issuer, saActual);
+    }
+
+    return terResult;
+}
+
+TER LedgerEntrySet::accountSend (
+    Account const& uSenderID, Account const& uReceiverID,
+    STAmount const& saAmount)
+{
+    assert (saAmount >= zero);
+
+    /* If we aren't sending anything or if the sender is the same as the
+     * receiver then we don't need to do anything.
+     */
+    if (!saAmount || (uSenderID == uReceiverID))
+        return tesSUCCESS;
+
+    if (!saAmount.isNative ())
+    {
+        STAmount saActual;
+
+        WriteLog (lsTRACE, LedgerEntrySet) << "accountSend: " <<
+            to_string (uSenderID) << " -> " << to_string (uReceiverID) <<
+            " : " << saAmount.getFullText ();
+
+        return skywellSend (uSenderID, uReceiverID, saAmount, saActual);
+    }
+
+    cacheCredit (uSenderID, uReceiverID, saAmount);
+
+    /* SWT send which does not check reserve and can do pure adjustment.
+     * Note that sender or receiver may be null and this not a mistake; this
+     * setup is used during pathfinding and it is carefully controlled to
+     * ensure that transfers are balanced.
+     */
+
+    TER terResult (tesSUCCESS);
+
+    SLE::pointer sender = uSenderID != skywell::zero
+        ? entryCache (ltACCOUNT_ROOT, getAccountRootIndex (uSenderID))
+        : SLE::pointer ();
+    SLE::pointer receiver = uReceiverID != skywell::zero
+        ? entryCache (ltACCOUNT_ROOT, getAccountRootIndex (uReceiverID))
+        : SLE::pointer ();
+
+    if (ShouldLog (lsTRACE, LedgerEntrySet))
+    {
+        std::string sender_bal ("-");
+        std::string receiver_bal ("-");
+
+        if (sender)
+            sender_bal = sender->getFieldAmount (sfBalance).getFullText ();
+
+        if (receiver)
+            receiver_bal = receiver->getFieldAmount (sfBalance).getFullText ();
+
+        WriteLog (lsTRACE, LedgerEntrySet) << "accountSend> " <<
+            to_string (uSenderID) << " (" << sender_bal <<
+            ") -> " << to_string (uReceiverID) << " (" << receiver_bal <<
+            ") : " << saAmount.getFullText ();
+    }
+
+    if (sender)
+    {
+        if (sender->getFieldAmount (sfBalance) < saAmount)
+        {
+            terResult = (mParams & tapOPEN_LEDGER)
+                ? telFAILED_PROCESSING
+                : tecFAILED_PROCESSING;
+        }
+        else
+        {
+            // Decrement SWT balance.
+            sender->setFieldAmount (sfBalance,
+                sender->getFieldAmount (sfBalance) - saAmount);
+            entryModify (sender);
+        }
+    }
+
+    if (tesSUCCESS == terResult && receiver)
+    {
+        // Increment SWT balance.
+        receiver->setFieldAmount (sfBalance,
+            receiver->getFieldAmount (sfBalance) + saAmount);
+        entryModify (receiver);
+    }
+
+    if (ShouldLog (lsTRACE, LedgerEntrySet))
+    {
+        std::string sender_bal ("-");
+        std::string receiver_bal ("-");
+
+        if (sender)
+            sender_bal = sender->getFieldAmount (sfBalance).getFullText ();
+
+        if (receiver)
+            receiver_bal = receiver->getFieldAmount (sfBalance).getFullText ();
+
+        WriteLog (lsTRACE, LedgerEntrySet) << "accountSend< " <<
+            to_string (uSenderID) << " (" << sender_bal <<
+            ") -> " << to_string (uReceiverID) << " (" << receiver_bal <<
+            ") : " << saAmount.getFullText ();
+    }
+
+    return terResult;
+}
 
 bool LedgerEntrySet::checkState (
     SLE::pointer state,
@@ -1303,6 +1840,322 @@ bool LedgerEntrySet::checkState (
     return false;
 }
 
+TER LedgerEntrySet::issue_iou (
+    Account const& account,
+    STAmount const& amount,
+    Issue const& issue)
+{
+    assert (!isSWT (account) && !isSWT (issue.account));
+
+    // Consistency check
+    assert (issue == amount.issue ());
+
+    // Can't send to self!
+    assert (issue.account != account);
+
+    WriteLog (lsTRACE, LedgerEntrySet) << "issue_iou: " <<
+        to_string (account) << ": " <<
+        amount.getFullText ();
+
+    bool bSenderHigh = issue.account > account;
+    uint256 const index = getSkywellStateIndex (
+        issue.account, account, issue.currency);
+    auto state = entryCache (ltSKYWELL_STATE, index);
+
+    if (!state)
+    {
+        // NIKB TODO: The limit uses the receiver's account as the issuer and
+        // this is unnecessarily inefficient as copying which could be avoided
+        // is now required. Consider available options.
+        STAmount limit({issue.currency, account});
+        STAmount final_balance = amount;
+
+        final_balance.setIssuer (noAccount());
+
+        SLE::pointer receiverAccount = entryCache (ltACCOUNT_ROOT,
+            getAccountRootIndex (account));
+
+        bool noSkywell = (receiverAccount->getFlags() & lsfDefaultSkywell) == 1;
+
+        // if (skywell::legacy::emulate027 (mLedger))
+        //     noSkywell = false;
+
+        return trustCreate (bSenderHigh, issue.account, account, index,
+            receiverAccount, false, noSkywell, false, final_balance, limit);
+    }
+
+    STAmount final_balance = state->getFieldAmount (sfBalance);
+
+    if (bSenderHigh)
+        final_balance.negate ();    // Put balance in sender terms.
+
+    STAmount const start_balance = final_balance;
+
+    final_balance -= amount;
+
+    auto const must_delete = checkState (state, bSenderHigh, issue.account,
+        start_balance, final_balance);
+
+    if (bSenderHigh)
+        final_balance.negate ();
+
+    cacheCredit (issue.account, account, amount);
+
+    // Adjust the balance on the trust line if necessary. We do this even if we
+    // are going to delete the line to reflect the correct balance at the time
+    // of deletion.
+    state->setFieldAmount (sfBalance, final_balance);
+
+    if (must_delete)
+    {
+        return trustDelete (state,
+            bSenderHigh ? account : issue.account,
+            bSenderHigh ? issue.account : account);
+    }
+
+    entryModify (state);
+    return tesSUCCESS;
+}
+
+TER LedgerEntrySet::redeem_iou (
+    Account const& account,
+    STAmount const& amount,
+    Issue const& issue)
+{
+    assert (!isSWT (account) && !isSWT (issue.account));
+
+    // Consistency check
+    assert (issue == amount.issue ());
+
+    // Can't send to self!
+    assert (issue.account != account);
+
+    WriteLog (lsTRACE, LedgerEntrySet) << "redeem_iou: " <<
+        to_string (account) << ": " <<
+        amount.getFullText ();
+
+    bool bSenderHigh = account > issue.account;
+    uint256 const index = getSkywellStateIndex (
+        account, issue.account, issue.currency);
+    auto state  = entryCache (ltSKYWELL_STATE, index);
+
+    if (!state)
+    {
+        // In order to hold an IOU, a trust line *MUST* exist to track the
+        // balance. If it doesn't, then something is very wrong. Don't try
+        // to continue.
+        WriteLog (lsFATAL, LedgerEntrySet) << "redeem_iou: " <<
+            to_string (account) << " attempts to redeem " <<
+            amount.getFullText () << " but no trust line exists!";
+
+        return tefINTERNAL;
+    }
+
+    STAmount final_balance = state->getFieldAmount (sfBalance);
+
+    if (bSenderHigh)
+        final_balance.negate ();    // Put balance in sender terms.
+
+    STAmount const start_balance = final_balance;
+
+    final_balance -= amount;
+
+    auto const must_delete = checkState (state, bSenderHigh, account,
+        start_balance, final_balance);
+
+    if (bSenderHigh)
+        final_balance.negate ();
+
+    cacheCredit (account, issue.account, amount);
+
+    // Adjust the balance on the trust line if necessary. We do this even if we
+    // are going to delete the line to reflect the correct balance at the time
+    // of deletion.
+    state->setFieldAmount (sfBalance, final_balance);
+
+    if (must_delete)
+    {
+        return trustDelete (state,
+            bSenderHigh ? issue.account : account,
+            bSenderHigh ? account : issue.account);
+    }
+
+    entryModify (state);
+    return tesSUCCESS;
+}
+
+TER LedgerEntrySet::transfer_xrp (
+    Account const& from,
+    Account const& to,
+    STAmount const& amount)
+{
+    assert (from != skywell::zero);
+    assert (to != skywell::zero);
+    assert (from != to);
+    assert (amount.isNative ());
+
+    SLE::pointer sender = entryCache (ltACCOUNT_ROOT,
+        getAccountRootIndex (from));
+    SLE::pointer receiver = entryCache (ltACCOUNT_ROOT,
+        getAccountRootIndex (to));
+
+    WriteLog (lsTRACE, LedgerEntrySet) << "transfer_xrp: " <<
+        to_string (from) <<  " -> " << to_string (to) <<
+        ") : " << amount.getFullText ();
+
+    if (sender->getFieldAmount (sfBalance) < amount)
+    {
+        // FIXME: this logic should be moved to callers maybe?
+        return (mParams & tapOPEN_LEDGER)
+            ? telFAILED_PROCESSING
+            : tecFAILED_PROCESSING;
+    }
+
+    // Decrement SWT balance.
+    sender->setFieldAmount (sfBalance,
+        sender->getFieldAmount (sfBalance) - amount);
+    entryModify (sender);
+
+    receiver->setFieldAmount (sfBalance,
+        receiver->getFieldAmount (sfBalance) + amount);
+    entryModify (receiver);
+
+    return tesSUCCESS;
+}
+
+TER LedgerEntrySet::accountFundsCheck (
+Account const& account, STAmount const& saTakerGets)
+{
+
+//    LedgerEntrySet  lesActive (mLedger, tapNONE, true);
+    std::vector <SLE::pointer> offers;
+	std::vector<SLE::pointer> freezes;
+	STAmount authors;
+	STAmount    saFreeze(saTakerGets);
+    STAmount    saTakerGetsFunded (saTakerGets);
+
+	Currency   freezecurrency = saTakerGets.getCurrency();
+	int freezerelation = 3;
+    if(!saTakerGets.isNative ())
+    {
+	Account mIssuerAccountID = mLedger->getIssuerOpAccountID ();
+	if (mIssuerAccountID == account)
+		return tesSUCCESS;
+    }
+
+    mLedger->visitAccountItems (account, 
+        [&offers](SLE::ref offer)
+        {
+            if (offer && (offer->getType () == ltOFFER))
+            {
+                offers.emplace_back (offer);
+            }
+
+        });
+	
+    for (auto const& offer : offers)
+    {
+	   STAmount TakerGets = offer->getFieldAmount (sfTakerGets);
+	   if((TakerGets.getCurrency() == saTakerGets.getCurrency()) && (TakerGets.getIssuer() == saTakerGets.getIssuer()))
+		   saTakerGetsFunded = saTakerGetsFunded + TakerGets;
+    }
+
+
+	mLedger->visitAccountItems(account,
+		[&freezes, &freezerelation](SLE::ref freeze)
+	{
+		if (freeze && (freeze->getType() == ltTrust_STATE) && (freeze->getFieldU32(sfRelationType) == freezerelation))
+		{
+
+			freezes.emplace_back(freeze);
+		}
+
+	});
+
+	for (auto const& freeze : freezes)
+	{
+		if ((account == freeze->getFieldAmount(sfLowLimit).getIssuer()) && (freeze->getFieldAmount(sfLowLimit).getCurrency() == freezecurrency) && (freeze->getFieldAmount(sfHighLimit) >= zero))
+		{
+			saFreeze = saFreeze + freeze->getFieldAmount(sfLowLimit);
+		}
+		else if ((account == freeze->getFieldAmount(sfHighLimit).getIssuer()) && (freeze->getFieldAmount(sfHighLimit).getCurrency() == freezecurrency) && (freeze->getFieldAmount(sfLowLimit) >= zero))
+		{
+			saFreeze = saFreeze + freeze->getFieldAmount(sfHighLimit);
+		}
+	}
+	saFreeze = saFreeze - saTakerGets;
+
+
+     auto const ownerFunds (accountFunds (account, saTakerGets, fhIGNORE_FREEZE));
+	 if (!ownerFunds || ownerFunds - saFreeze < saTakerGetsFunded)
+     {
+	    Account mAuthorAccountID = AuthorizeAccountGet(account,saTakerGets.getCurrency());
+
+		if(mAuthorAccountID != noAccount() )
+		{
+			mLedger->visitAccountItems(mAuthorAccountID,
+				[&authors, &mAuthorAccountID, &saTakerGets](SLE::ref author)
+			{
+
+				if (author && (author->getType() == ltTrust_STATE) && (author->getFieldU32(sfRelationType) == 1))
+				{
+					if (author->getFieldAmount(sfLowLimit).getIssuer() == mAuthorAccountID&&author->getFieldAmount(sfLowLimit).getCurrency() == saTakerGets.getCurrency() && author->getFieldAmount(sfLowLimit)>zero)
+					{
+						authors = author->getFieldAmount(sfLowLimit);
+					}
+					else if (author->getFieldAmount(sfHighLimit).getIssuer() == mAuthorAccountID&&author->getFieldAmount(sfHighLimit).getCurrency() == saTakerGets.getCurrency() && author->getFieldAmount(sfHighLimit)>zero)
+					{
+						authors = author->getFieldAmount(sfHighLimit);
+					}
+				}
+			});
+		     auto const authorFunds (accountFunds (mAuthorAccountID, saTakerGets, fhIGNORE_FREEZE));
+			 authors = (authors <= authorFunds) ? authors : authorFunds;
+			 if (authors && (authors + ownerFunds - saFreeze >= saTakerGetsFunded))
+			{
+				if (accountSend(mAuthorAccountID, account, (saTakerGetsFunded - ownerFunds +saFreeze)) == tesSUCCESS)
+				{
+					return tesSUCCESS;
+				}
+			}
+		}
+	 	return telINSUF_FUND;
+     }
+     else
+		return tesSUCCESS;
+
+}
+
+//Tie 
+Account LedgerEntrySet::AuthorizeAccountGet (Account const& account, Currency const& currency)
+{
+    std::vector <SLE::pointer> TieAccount;
+    mLedger->visitAccountItems (account, 
+        [&TieAccount](SLE::ref sleCur)
+        {
+            if (sleCur && (sleCur->getType () == ltTrust_STATE))
+            {
+             		if(sleCur->getFieldU32(sfRelationType)  == 1)
+             		{
+		                TieAccount.emplace_back (sleCur);
+             		}
+            }
+
+        });
+    for (auto const& sleCur : TieAccount)
+    {
+		if((account == sleCur->getFieldAmount(sfLowLimit).getIssuer()) && (sleCur->getFieldAmount(sfLowLimit).getCurrency() ==currency) && (sleCur->getFieldAmount(sfHighLimit) > zero))
+		{
+			return sleCur->getFieldAmount(sfHighLimit).getIssuer();
+			}
+		else if((account == sleCur->getFieldAmount(sfHighLimit).getIssuer())&& (sleCur->getFieldAmount(sfHighLimit).getCurrency() ==currency)&& (sleCur->getFieldAmount(sfLowLimit) > zero) )
+			{
+			return sleCur->getFieldAmount(sfLowLimit).getIssuer();
+			}
+    	}	
+	return noAccount();
+
+}
 
 std::uint32_t
 skywellTransferRate (LedgerEntrySet& ledger, Account const& issuer,Currency const& currency)

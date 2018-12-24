@@ -532,8 +532,6 @@ void Config::loadFromString (std::string const& fileContents)
        FEE_ACCOUNTID.setAccountID(strTemp);
     if (getSingleSection (secConfig, SECTION_SMNG_ACCOUNTID, strTemp))
        SMNG_ACCOUNTID.setAccountID(strTemp);
-    if (getSingleSection (secConfig, SECTION_SISSUER_ACCOUNTID, strTemp))
-       SISSUER_ACCOUNTID.setAccountID(strTemp);
 
     if (getSingleSection (secConfig, SECTION_LEDGER_HISTORY, strTemp))
     {

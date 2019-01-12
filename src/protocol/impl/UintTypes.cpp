@@ -76,29 +76,7 @@ bool to_currency(Currency& currency, std::string const& code)
         currency = zero;
         return true;
     }
-
-    static const int CURRENCY_CODE_LENGTH = 3;
-    if (code.size () == CURRENCY_CODE_LENGTH)
-    {
-        Blob codeBlob (CURRENCY_CODE_LENGTH);
-
-        std::transform (code.begin (), code.end (), codeBlob.begin (), ::toupper);
-
-        Serializer  s;
-
-        s.addZeros (96 / 8);
-        s.addRaw (codeBlob);
-        s.addZeros (16 / 8);
-        s.addZeros (24 / 8);
-
-        s.get160 (currency, 0);
-        return true;
-    }
-
-    if (40 == code.size ())
-        return currency.SetHex (code);
-
-    return false;
+      return false;
 }
 
 Currency to_currency(std::string const& code)
@@ -149,7 +127,7 @@ Currency const& noCurrency()
 
 Currency const& badCurrency()
 {
-    static Currency const currency(0x5852500000000000);
+    static Currency const currency(0x5357540000000000);
     return currency;
 }
 

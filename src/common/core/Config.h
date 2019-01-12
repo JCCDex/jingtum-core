@@ -240,7 +240,6 @@ public:
     int                         FEE_CONTRACT_OPERATION; // fee for each contract operation
     SkywellAddress              FEE_ACCOUNTID;
     SkywellAddress              SMNG_ACCOUNTID;
-    SkywellAddress              SISSUER_ACCOUNTID;
   
     // Node storage configuration
     std::uint32_t                      LEDGER_HISTORY;

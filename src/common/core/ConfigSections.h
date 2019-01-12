@@ -41,7 +41,6 @@ struct ConfigSection
 #define SECTION_FEE_DEFAULT             "fee_default"
 #define SECTION_FEE_ACCOUNTID             "fee_accountid"
 #define SECTION_SMNG_ACCOUNTID             "manager_accountid"
-#define SECTION_SISSUER_ACCOUNTID             "issuer_accountid"
 #define SECTION_FEE_OFFER               "fee_offer"
 #define SECTION_FEE_OPERATION           "fee_operation"
 #define SECTION_FEE_ACCOUNT_RESERVE     "fee_account_reserve"
